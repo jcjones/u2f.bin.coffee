@@ -4,7 +4,7 @@
 <head>
 <title>U2F checker</title>
 <script type="text/javascript" src="https://ajax.googleapis.com/ajax/libs/jquery/1.11.2/jquery.min.js"></script>
-<!-- <script type="text/javascript" src="u2f-api.js"></script> -->
+<script type="text/javascript" src="u2f-api.js"></script>
 <script type="text/javascript" src="base64.js"></script>
 <script type="text/javascript" src="pkijs/common.js"></script>
 <script type="text/javascript" src="pkijs/asn1.js"></script>
@@ -29,6 +29,12 @@ function testEqual(id, val1, val2) {
   var result = (val1 == val2);
   var cmp = (result)? " == " : " != ";
   return test(id, result, "" + val1 + cmp + val2);
+}
+
+function testEqualD(id, val1, val2, description) {
+  var result = (val1 == val2);
+  var cmp = (result)? " == " : " != ";
+  return test(id, result, description + ": " + val1 + cmp + val2);
 }
 
 function resultColor(id, success) {
@@ -101,7 +107,29 @@ function importPublicKey(keyBytes) {
   return crypto.subtle.importKey("jwk", jwk, {name: "ECDSA", namedCurve: "P-256"}, true, ["verify"])
 }
 
-function assembleSignedData(appId, presenceAndCounter, clientData) {
+function assembleRegisterSignedData(appId, clientData, keyHandle, publicKeyBytes) {
+  var appIdBuf = string2buffer(appId);
+  return Promise.all([
+    crypto.subtle.digest("SHA-256", appIdBuf),
+    crypto.subtle.digest("SHA-256", clientData)
+  ])
+  .then(function(digests) {
+    var appParam = new Uint8Array(digests[0]);
+    var clientParam = new Uint8Array(digests[1]);
+
+    test()
+
+    var signedData = new Uint8Array(1 + 32 + 32 + keyHandle.length + publicKeyBytes.length);
+    signedData[0] = 0x00;
+    appParam.map(function(x, i) { return signedData[1+i] = x });
+    clientParam.map(function(x, i) { return signedData[33+i] = x });
+    keyHandle.map(function(x, i) { return signedData[65+i] = x });
+    publicKeyBytes.map(function(x, i) { return signedData[65+keyHandle.length+i] = x });
+    return signedData;
+  });
+}
+
+function assembleSignSignedData(appId, presenceAndCounter, clientData) {
   var appIdBuf = string2buffer(appId);
   return Promise.all([
     crypto.subtle.digest("SHA-256", appIdBuf),
@@ -161,38 +189,6 @@ function asn1Okay(asn1) {
   return true;
 }
 
-// Example from:
-// https://fidoalliance.org/specs/fido-u2f-v1.0-nfc-bt-amendment-20150514/fido-u2f-raw-message-formats.html
-//
-// Run this example from the console to check that the above utility methods work
-function runExample() {
-  var pubKey = hexDecode("04d368f1b665bade3c33a20f1e429c7750d5033660c019119d29aa4ba7abc04aa7c80a46bbe11ca8cb5674d74f31f8a903f6bad105fb6ab74aefef4db8b0025e1d");
-  var appId = "https://gstatic.com/securitykey/a/example.com";
-  var clientData = string2buffer('{"typ":"navigator.id.getAssertion","challenge":"opsXqUifDriAAmWclinfbS0e-USY0CgyJHe_Otd7z8o","cid_pubkey":{"kty":"EC","crv":"P-256","x":"HzQwlfXX7Q4S5MtCCnZUNBw3RMzPO9tOyWjBqRl4tJ8","y":"XVguGFLIZx1fXg3wNqfdbn75hi4-_7-BxhMljw42Ht4"},"origin":"http://example.com"}');
-  var presenceAndCounter = hexDecode("0100000001");
-  var signature = hexDecode("304402204b5f0cd17534cedd8c34ee09570ef542a353df4436030ce43d406de870b847780220267bb998fac9b7266eb60e7cb0b5eabdfd5ba9614f53c7b22272ec10047a923f");
-
-  // Import the key
-  // Assemble the client data
-  // Verify
-  Promise.all([
-    importPublicKey(pubKey),
-    assembleSignedData(appId, presenceAndCounter, clientData)
-  ])
-  .then(function(results) {
-    var importedKey = results[0];
-    var signedData = new Uint8Array(results[1]);
-    return verifySignature(importedKey, signedData, signature);
-  })
-  .then(function(verified) {
-    console.log("verified:", verified);
-  })
-  .catch(function(err) {
-    console.log("error:", err);
-  });
-}
-
-
 $(document).ready(function() {
   if (!window.u2f) {
     $("#error").text("U2F API not found");
@@ -208,12 +204,12 @@ $(document).ready(function() {
   $("#regButton").click(function() {
     $("#regOut").text("");
 
-    var challenge = new Uint8Array(16);
-    window.crypto.getRandomValues(challenge);
+    state.challenge = new Uint8Array(20);
+    window.crypto.getRandomValues(state.challenge);
 
     state.regRequest = {
       version: state.version,
-      challenge: b64enc(challenge),
+      challenge: b64enc(state.challenge),
     };
     append("regOut", "Sending request:\n");
     append("regOut", JSON.stringify(state.regRequest, null, 2) + "\n\n");
@@ -235,49 +231,72 @@ $(document).ready(function() {
       }
       state.publicKeyBytes = registrationData.subarray(1, 66);
       var keyHandleLength = registrationData[66];
-      state.keyHandle = b64enc(registrationData.subarray(67, 67 + keyHandleLength));
+      state.keyHandleBytes = registrationData.subarray(67, 67 + keyHandleLength)
+      state.keyHandle = b64enc(state.keyHandleBytes);
       state.attestation = new Uint8Array(registrationData.subarray(67 + keyHandleLength));
 
       append("regOut", "Key Handle: " + hexEncode(state.keyHandle) + "\n");
       append("regOut", "Certificate: " + hexEncode(state.attestation) + "\n");
 
       var certAsn1 = org.pkijs.fromBER(state.attestation.buffer);
-      if (asn1Okay(certAsn1)) {
-        state.attestationSig = new Uint8Array(state.attestation.slice(certAsn1.offset));
-        state.attestationCert = new org.pkijs.simpl.CERT({ schema: certAsn1.result });
-        append("regOut", "Attestation Cert\n");
-        append("regOut", "Subject: " + state.attestationCert.subject.types_and_values[0].value.value_block.value + "\n");
-        append("regOut", "Issuer: " + state.attestationCert.issuer.types_and_values[0].value.value_block.value + "\n");
-        append("regOut", "Validity (in millis): " + (state.attestationCert.notAfter.value - state.attestationCert.notBefore.value + "\n"));
+      if (!asn1Okay(certAsn1)) {
+        throw "Cert ASN.1 not okay";
+      }
+      state.attestationSig = new Uint8Array(state.attestation.slice(certAsn1.offset));
+      state.attestationCert = new org.pkijs.simpl.CERT({ schema: certAsn1.result });
+      append("regOut", "Attestation Cert\n");
+      append("regOut", "Subject: " + state.attestationCert.subject.types_and_values[0].value.value_block.value + "\n");
+      append("regOut", "Issuer: " + state.attestationCert.issuer.types_and_values[0].value.value_block.value + "\n");
+      append("regOut", "Validity (in millis): " + (state.attestationCert.notAfter.value - state.attestationCert.notBefore.value + "\n"));
 
-        var sigAsn1 = org.pkijs.fromBER(state.attestationSig.buffer);
-        if (asn1Okay(sigAsn1)) {
-          append("regOut", "Attestation Signature\n");
-          var R = new Uint8Array(sigAsn1.result.value_block.value[0].value_block.value_hex);
-          var S = new Uint8Array(sigAsn1.result.value_block.value[1].value_block.value_hex);
-          append("regOut", "R: " + hexEncode(R) + "\n");
-          append("regOut", "S: " + hexEncode(S) + "\n");
-        }
+      var sigAsn1 = org.pkijs.fromBER(state.attestationSig.buffer);
+      if (!asn1Okay(sigAsn1)) {
+        throw "Signature ASN.1 not okay";
       }
 
-      // Verify that the clientData makes sense
-      var clientDataJSON = "";
-      b64dec(regResponse.clientData).map(function(x) { return clientDataJSON += String.fromCharCode(x) });
-      var clientData = JSON.parse(clientDataJSON);
-      success = success && testEqual("regOut", "navigator.id.finishEnrollment", clientData.typ);
-      success = success && testEqual("regOut", b64enc(challenge), clientData.challenge);
-      success = success && testEqual("regOut", window.location.origin, clientData.origin);
+      append("regOut", "Attestation Signature\n");
+      var R = new Uint8Array(sigAsn1.result.value_block.value[0].value_block.value_hex);
+      var S = new Uint8Array(sigAsn1.result.value_block.value[1].value_block.value_hex);
+      append("regOut", "R: " + hexEncode(R) + "\n");
+      append("regOut", "S: " + hexEncode(S) + "\n");
 
-      // Import the public key
-      importPublicKey(state.publicKeyBytes)
+      success = success && testEqualD("regOut", sigAsn1.result.block_length, state.attestationSig.buffer.byteLength, "Signature buffer has no unnecessary bytes.");
+
+      // Verify that the clientData makes sense
+      var clientData = b64dec(regResponse.clientData)
+
+      var clientDataJSON = "";
+      clientData.map(function(x) { return clientDataJSON += String.fromCharCode(x) });
+      var clientDataObj = JSON.parse(clientDataJSON);
+      success = success && testEqual("regOut", "navigator.id.finishEnrollment", clientDataObj.typ);
+      success = success && testEqual("regOut", b64enc(state.challenge), clientDataObj.challenge);
+      success = success && testEqual("regOut", window.location.origin, clientDataObj.origin);
+
+      // Import the attestation certificate's public key
+      importPublicKey(new Uint8Array(state.attestationCert.subjectPublicKeyInfo.subjectPublicKey.value_block.value_hex))
+      .then(function(certPubKey){
+        state.certPubKey = certPubKey;
+        return assembleRegisterSignedData(state.appId, clientData, state.keyHandleBytes, state.publicKeyBytes);
+      })
+      .then(function(signedData){
+        console.log("Signed data: ", signedData, b64enc(signedData));
+        return verifySignature(state.certPubKey, signedData, new Uint8Array(state.attestationSig.buffer));
+      })
+      .then(function(verified) {
+        console.log("No error verifying signature");
+        success = success && test("regOut", verified, "Verified certificate attestation signature");
+
+        // Import the new credential public key
+        return importPublicKey(state.publicKeyBytes);
+      })
       .then(function(key) {
         state.publicKey = key;
-        success = success && test("regOut", true, "Imported public key");
+        success = success && test("regOut", true, "Imported credential public key");
         resultColor("regOut", success);
       })
       .catch(function(err) {
-        console.log(err);
-        success = success && test("regOut", false, "Imported public key");
+        console.log("Problem during execution", err);
+        success = success && test("regOut", false, "Imported credential public key");
         resultColor("regOut", success);
       });
     });
@@ -324,10 +343,17 @@ $(document).ready(function() {
         throw "User presence byte not set";
       }
       var presenceAndCounter = signatureData.subarray(0,5);
-      var signatureValue = signatureData.subarray(5);
+      var signatureValue = new Uint8Array(signatureData.subarray(5));
+
+      var sigAsn1 = org.pkijs.fromBER(signatureValue.buffer);
+      if (!asn1Okay(sigAsn1)) {
+        throw "Signature ASN.1 not valid";
+      }
+
+      success = success && testEqualD("signOut", sigAsn1.result.block_length, signatureValue.buffer.byteLength, "Signature buffer has no unnecessary bytes.");
 
       // Assemble the signed data and verify the signature
-      assembleSignedData(state.appId, presenceAndCounter, clientData)
+      assembleSignSignedData(state.appId, presenceAndCounter, clientData)
       .then(function(signedData) {
         return verifySignature(state.publicKey, signedData, signatureValue);
       })
