@@ -11,14 +11,64 @@
 <script type="text/javascript" src="pkijs/x509_schema.js"></script>
 <script type="text/javascript" src="pkijs/x509_simpl.js"></script>
 <script>
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+ * You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-var TIMEOUT = 2000; // ms
+class ResultTracker {
+  construct() {
+    this.reset()
+  }
+  reset() {
+    this.failCount = 0;
+    this.todoCount = 0;
+  }
+  fail() {
+    this.failCount += 1;
+  }
+  todo() {
+    this.todoCount += 1;
+  }
+  get failures() {
+    return this.failCount;
+  }
+  get todos() {
+    return this.todoCount;
+  }
+  passed() {
+    return this.failures == 0;
+  }
+  toString() {
+    return "Failures: " + this.failures + " TODOs: " + this.todos;
+  }
+}
+
+var gResults = new ResultTracker()
+
+function promiseU2FRegister(aAppId, aChallenges, aExcludedKeys, aFunc) {
+  return new Promise(function(resolve, reject) {
+      u2f.register(aAppId, aChallenges, aExcludedKeys, function(res) {
+        aFunc(res);
+        resolve(res);
+      });
+  });
+}
+
+function promiseU2FSign(aAppId, aChallenge, aAllowedKeys, aFunc) {
+  return new Promise(function(resolve, reject) {
+      u2f.sign(aAppId, aChallenge, aAllowedKeys, function(res) {
+        aFunc(res);
+        resolve(res);
+      });
+  });
+}
 
 function append(id, text) {
   $("#"+id).text($("#"+id).text() + text);
 }
 
 function test(id, test, text) {
+  if (!test) { gResults.fail(); }
   var message = (test)? "[PASS]" : "[FAIL]";
   message += " " + text + "\n";
   append(id, message);
@@ -37,9 +87,16 @@ function testEqualD(id, val1, val2, description) {
   return test(id, result, description + ": " + val1 + cmp + val2);
 }
 
-function resultColor(id, success) {
-  if (success) { $("#"+id).addClass("success"); }
-  else         { $("#"+id).addClass("failure"); }
+function resultColor(id) {
+  if (gResults.failures == 0) {
+    if (gResults.todos == 0) {
+      $("#"+id).removeClass("failure"); $("#"+id).removeClass("todo"); $("#"+id).addClass("success");
+    } else {
+      $("#"+id).removeClass("failure"); $("#"+id).removeClass("success"); $("#"+id).addClass("todo");
+    }
+  } else {
+    $("#"+id).removeClass("success"); $("#"+id).removeClass("todo"); $("#"+id).addClass("failure");
+  }
 }
 
 function hexEncode(buf) {
@@ -117,8 +174,6 @@ function assembleRegisterSignedData(appId, clientData, keyHandle, publicKeyBytes
     var appParam = new Uint8Array(digests[0]);
     var clientParam = new Uint8Array(digests[1]);
 
-    test()
-
     var signedData = new Uint8Array(1 + 32 + 32 + keyHandle.length + publicKeyBytes.length);
     signedData[0] = 0x00;
     appParam.map(function(x, i) { return signedData[1+i] = x });
@@ -193,16 +248,21 @@ $(document).ready(function() {
   if (!window.u2f) {
     $("#error").text("U2F API not found");
     $("button").addClass("inactive");
+    return;
   }
+
   var u2f = window.u2f;
 
   state.version = "U2F_V2";
   state.appId = window.location.origin;
 
-  var success = true;
-
   $("#regButton").click(function() {
+    gResults.reset();
     $("#regOut").text("");
+
+    if ($("#facetIdText").val()) {
+      state.appId = $("#facetIdText").val();
+    }
 
     state.challenge = new Uint8Array(20);
     window.crypto.getRandomValues(state.challenge);
@@ -211,17 +271,17 @@ $(document).ready(function() {
       version: state.version,
       challenge: b64enc(state.challenge),
     };
-    append("regOut", "Sending request:\n");
+    append("regOut", "Sending request with appId: " + state.appId + "\n");
     append("regOut", JSON.stringify(state.regRequest, null, 2) + "\n\n");
 
-    u2f.register(state.appId, [state.regRequest], [], function(regResponse) {
+    promiseU2FRegister(state.appId, [state.regRequest], [], ()=>{})
+    .then(function(regResponse) {
       state.regResponse = regResponse;
       append("regOut", "Got response:\n");
       append("regOut", JSON.stringify(regResponse, null, 2) + "\n\n");
 
       if (regResponse.errorCode) {
-        resultColor("regOut", false);
-        return;
+        throw "Unexpected error code: " + regResponse.errorCode;
       }
 
       // Parse the response data
@@ -229,6 +289,7 @@ $(document).ready(function() {
       if (registrationData[0] != 0x05) {
         throw "Reserved byte not set correctly";
       }
+
       state.publicKeyBytes = registrationData.subarray(1, 66);
       var keyHandleLength = registrationData[66];
       state.keyHandleBytes = registrationData.subarray(67, 67 + keyHandleLength)
@@ -260,7 +321,7 @@ $(document).ready(function() {
       append("regOut", "R: " + hexEncode(R) + "\n");
       append("regOut", "S: " + hexEncode(S) + "\n");
 
-      success = success && testEqualD("regOut", sigAsn1.result.block_length, state.attestationSig.buffer.byteLength, "Signature buffer has no unnecessary bytes.");
+      testEqualD("regOut", sigAsn1.result.block_length, state.attestationSig.buffer.byteLength, "Signature buffer has no unnecessary bytes.");
 
       // Verify that the clientData makes sense
       var clientData = b64dec(regResponse.clientData)
@@ -268,41 +329,44 @@ $(document).ready(function() {
       var clientDataJSON = "";
       clientData.map(function(x) { return clientDataJSON += String.fromCharCode(x) });
       var clientDataObj = JSON.parse(clientDataJSON);
-      success = success && testEqual("regOut", "navigator.id.finishEnrollment", clientDataObj.typ);
-      success = success && testEqual("regOut", b64enc(state.challenge), clientDataObj.challenge);
-      success = success && testEqual("regOut", window.location.origin, clientDataObj.origin);
+      testEqual("regOut", "navigator.id.finishEnrollment", clientDataObj.typ);
+      testEqual("regOut", b64enc(state.challenge), clientDataObj.challenge);
+      testEqual("regOut", window.location.origin, clientDataObj.origin);
 
       // Import the attestation certificate's public key
-      importPublicKey(new Uint8Array(state.attestationCert.subjectPublicKeyInfo.subjectPublicKey.value_block.value_hex))
+      return importPublicKey(new Uint8Array(state.attestationCert.subjectPublicKeyInfo.subjectPublicKey.value_block.value_hex))
       .then(function(certPubKey){
         state.certPubKey = certPubKey;
         return assembleRegisterSignedData(state.appId, clientData, state.keyHandleBytes, state.publicKeyBytes);
-      })
-      .then(function(signedData){
-        console.log("Signed data: ", signedData, b64enc(signedData));
-        return verifySignature(state.certPubKey, signedData, new Uint8Array(state.attestationSig.buffer));
-      })
-      .then(function(verified) {
-        console.log("No error verifying signature");
-        success = success && test("regOut", verified, "Verified certificate attestation signature");
-
-        // Import the new credential public key
-        return importPublicKey(state.publicKeyBytes);
-      })
-      .then(function(key) {
-        state.publicKey = key;
-        success = success && test("regOut", true, "Imported credential public key");
-        resultColor("regOut", success);
-      })
-      .catch(function(err) {
-        console.log("Problem during execution", err);
-        success = success && test("regOut", false, "Imported credential public key");
-        resultColor("regOut", success);
       });
+    })
+    .then(function(signedData){
+      console.log("Signed data: ", signedData, b64enc(signedData));
+      return verifySignature(state.certPubKey, signedData, new Uint8Array(state.attestationSig.buffer));
+    })
+    .then(function(verified) {
+      console.log("No error verifying signature");
+      test("regOut", verified, "Verified certificate attestation signature");
+
+      // Import the new credential public key
+      return importPublicKey(state.publicKeyBytes);
+    })
+    .then(function(key) {
+      state.publicKey = key;
+      test("regOut", true, "Imported credential public key");
+    })
+    .catch(function(err) {
+      console.log("Problem during execution", err);
+      test("regOut", false, "Imported credential public key");
+    })
+    .then(function (){
+      resultColor("regOut");
+      append("regOut", gResults.toString());
     });
   });
 
   $("#signButton").click(function() {
+    gResults.reset();
     $("#signOut").text("");
 
     var challenge = new Uint8Array(16);
@@ -316,16 +380,14 @@ $(document).ready(function() {
     append("signOut", "Sending request:\n");
     append("signOut", JSON.stringify(state.registeredKey, null, 2) + "\n\n");
 
-    var success = true;
-
-    u2f.sign(state.appId, state.challenge, [state.registeredKey], function(signResponse) {
+    promiseU2FSign(state.appId, state.challenge, [state.registeredKey], ()=>{})
+    .then(function(signResponse) {
       state.signResponse = signResponse;
       append("signOut", "Got response:\n");
       append("signOut", JSON.stringify(signResponse, null, 2) + "\n\n");
 
       if (signResponse.errorCode) {
-        resultColor("signOut", false);
-        return;
+        throw "Error found " + signResponse.errorCode;
       }
 
       // Verify that the clientData makes sense
@@ -333,9 +395,9 @@ $(document).ready(function() {
       var clientDataJSON = "";
       clientData.map(function (x) { return clientDataJSON += String.fromCharCode(x) });
       var clientDataObj = JSON.parse(clientDataJSON);
-      success = success && testEqual("signOut", "navigator.id.getAssertion", clientDataObj.typ);
-      success = success && testEqual("signOut", b64enc(challenge), clientDataObj.challenge);
-      success = success && testEqual("signOut", window.location.origin, clientDataObj.origin);
+      testEqual("signOut", "navigator.id.getAssertion", clientDataObj.typ);
+      testEqual("signOut", b64enc(challenge), clientDataObj.challenge);
+      testEqual("signOut", window.location.origin, clientDataObj.origin);
 
       // Parse the signature data
       var signatureData = b64dec(signResponse.signatureData);
@@ -350,23 +412,25 @@ $(document).ready(function() {
         throw "Signature ASN.1 not valid";
       }
 
-      success = success && testEqualD("signOut", sigAsn1.result.block_length, signatureValue.buffer.byteLength, "Signature buffer has no unnecessary bytes.");
+      testEqualD("signOut", sigAsn1.result.block_length, signatureValue.buffer.byteLength, "Signature buffer has no unnecessary bytes.");
 
       // Assemble the signed data and verify the signature
-      assembleSignSignedData(state.appId, presenceAndCounter, clientData)
+      return assembleSignSignedData(state.appId, presenceAndCounter, clientData)
       .then(function(signedData) {
         return verifySignature(state.publicKey, signedData, signatureValue);
       })
-      .then(function(verified) {
-        console.log("No error verifying signature");
-        success = success && test("signOut", verified, "Verified signature");
-        resultColor("signOut", success);
-      })
-      .catch(function(err) {
-        console.log(err);
-        success = success && test("signOut", false, "Verified signature");
-        resultColor("signOut", success);
-      });
+    })
+    .then(function(verified) {
+      console.log("No error verifying signature");
+      test("signOut", verified, "Verified signature");
+    })
+    .catch(function(err) {
+      console.log(err);
+      test("signOut", false, "Verified signature");
+    })
+    .then(function (){
+      resultColor("signOut");
+      append("signOut", gResults.toString());
     });
   });
 });
@@ -470,6 +534,12 @@ pre {
   <!-- sign -->
   <button id="signButton">U2F Sign</button>
   <pre id="signOut"></pre>
+
+  <div class="box">
+    <p class="subtitle">Advanced</p>
+    <p>Facet ID to use.</p>
+    <input id="facetIdText" type="text" size="50"/>
+  </div>
  </div>
 </div>
 </body>
